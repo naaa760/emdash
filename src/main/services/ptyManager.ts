@@ -215,6 +215,24 @@ function markSessionCreated(ptyId: string, uuid: string, cwd: string): void {
   }
 }
 
+/** Remove a stale session from the map so the next start uses a fresh session. */
+export function clearStaleSession(ptyId: string): void {
+  const map = loadSessionMap();
+  if (ptyId in map) {
+    delete map[ptyId];
+    try {
+      fs.writeFileSync(sessionMapPath(), JSON.stringify(map));
+    } catch (e) {
+      log.warn('ptyManager: failed to persist session map after clear', e);
+    }
+  }
+}
+
+/** True if the PTY had a known session (we used --resume). */
+export function hadKnownSession(ptyId: string): boolean {
+  return !!getKnownSessionId(ptyId);
+}
+
 /**
  * Discover the existing Claude session ID for a working directory by scanning
  * Claude Code's local project storage (~/.claude/projects/<encoded-path>/).

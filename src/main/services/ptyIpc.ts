@@ -10,6 +10,8 @@ import {
   startSshPty,
   removePtyRecord,
   setOnDirectCliExit,
+  clearStaleSession,
+  hadKnownSession,
   parseShellArgs,
   buildProviderCliArgs,
   resolveProviderCommandConfig,
@@ -51,6 +53,20 @@ type FinishCause = 'process_exit' | 'app_quit' | 'owner_destroyed' | 'manual_kil
 const ptyDataBuffers = new Map<string, string>();
 const ptyDataTimers = new Map<string, NodeJS.Timeout>();
 const PTY_DATA_FLUSH_MS = 16;
+
+const STALE_SESSION_ERROR = 'No conversation found with session ID';
+
+type DirectSpawnParams = {
+  providerId: string;
+  cwd: string;
+  cols: number;
+  rows: number;
+  autoApprove?: boolean;
+  initialPrompt?: string;
+  env?: Record<string, string>;
+};
+const directSpawnParams = new Map<string, DirectSpawnParams>();
+const retryingStaleSession = new Set<string>();
 
 // Guard IPC sends to prevent crashes when WebContents is destroyed
 function safeSendToOwner(id: string, channel: string, payload: unknown): boolean {
@@ -256,13 +272,76 @@ async function resolveShellSetup(cwd: string): Promise<string | undefined> {
 }
 
 export function registerPtyIpc(): void {
-  // When a direct-spawned CLI exits, spawn a shell so user can continue working
   setOnDirectCliExit(async (id: string, cwd: string) => {
     const wc = owners.get(id);
     if (!wc) return;
 
+    const output = ptyDataBuffers.get(id) || '';
+    const parsed = parsePtyId(id);
+    const provider = parsed ? getProvider(parsed.providerId as ProviderId) : null;
+    const usedResume = provider?.sessionIdFlag && hadKnownSession(id);
+    const isStaleSessionError = output.includes(STALE_SESSION_ERROR) && usedResume;
+
+    if (isStaleSessionError && !retryingStaleSession.has(id)) {
+      retryingStaleSession.add(id);
+      clearStaleSession(id);
+      const params = directSpawnParams.get(id);
+      directSpawnParams.delete(id);
+
+      if (params) {
+        try {
+          removePtyRecord(id);
+          const newProc = startDirectPty({
+            id,
+            providerId: params.providerId,
+            cwd: params.cwd,
+            cols: params.cols,
+            rows: params.rows,
+            autoApprove: params.autoApprove,
+            initialPrompt: params.initialPrompt,
+            env: params.env,
+            resume: false,
+          });
+
+          if (newProc) {
+            listeners.delete(id);
+            newProc.onData((data) => bufferedSendPtyData(id, data));
+            newProc.onExit(({ exitCode, signal }) => {
+              flushPtyData(id);
+              clearPtyData(id);
+              retryingStaleSession.delete(id);
+              maybeMarkProviderFinish(
+                id,
+                exitCode,
+                signal,
+                isAppQuitting ? 'app_quit' : 'process_exit'
+              );
+              const current = getPty(id);
+              if (current && current !== newProc) return;
+              safeSendToOwner(id, `pty:exit:${id}`, { exitCode, signal });
+              listeners.delete(id);
+              removePtyRecord(id);
+            });
+            listeners.add(id);
+
+            if (!wc.isDestroyed()) {
+              wc.send('pty:started', { id });
+            }
+            return;
+          }
+        } catch (err) {
+          log.warn('ptyIpc: Stale session retry failed', { id, error: err });
+        }
+        retryingStaleSession.delete(id);
+      }
+    }
+
+    if (retryingStaleSession.has(id)) {
+      retryingStaleSession.delete(id);
+    }
+    directSpawnParams.delete(id);
+
     try {
-      // Spawn a shell in the same terminal
       const proc = await startPty({
         id,
         cwd,
@@ -272,17 +351,13 @@ export function registerPtyIpc(): void {
 
       if (!proc) {
         log.warn('ptyIpc: Failed to spawn shell after CLI exit', { id });
-        killPty(id); // Clean up dead PTY record
+        killPty(id);
         return;
       }
 
-      // Re-attach listeners for the new shell process
-      listeners.delete(id); // Clear old listener registration
+      listeners.delete(id);
       if (!listeners.has(id)) {
-        proc.onData((data) => {
-          bufferedSendPtyData(id, data);
-        });
-
+        proc.onData((data) => bufferedSendPtyData(id, data));
         proc.onExit(({ exitCode, signal }) => {
           flushPtyData(id);
           clearPtyData(id);
@@ -294,13 +369,12 @@ export function registerPtyIpc(): void {
         listeners.add(id);
       }
 
-      // Notify renderer that shell is ready (reuse pty:started so existing listener handles it)
       if (!wc.isDestroyed()) {
         wc.send('pty:started', { id });
       }
     } catch (err) {
       log.error('ptyIpc: Error spawning shell after CLI exit', { id, error: err });
-      killPty(id); // Clean up dead PTY record
+      killPty(id);
     }
   });
 
@@ -833,7 +907,6 @@ export function registerPtyIpc(): void {
           }
         }
 
-        // Try direct spawn first; skip if shellSetup requires a shell wrapper
         const directProc = shellSetup
           ? null
           : startDirectPty({
@@ -848,10 +921,18 @@ export function registerPtyIpc(): void {
               resume: effectiveResume,
             });
 
-        // Fall back to shell-based spawn when direct spawn is unavailable or shellSetup is set
         let usedFallback = false;
         let proc: import('node-pty').IPty;
         if (directProc) {
+          directSpawnParams.set(id, {
+            providerId,
+            cwd,
+            cols: cols ?? 120,
+            rows: rows ?? 32,
+            autoApprove,
+            initialPrompt,
+            env,
+          });
           proc = directProc;
         } else {
           const provider = getProvider(providerId as ProviderId);
@@ -884,6 +965,11 @@ export function registerPtyIpc(): void {
           });
 
           proc.onExit(({ exitCode, signal }) => {
+            if (retryingStaleSession.has(id)) {
+              clearPtyData(id);
+              listeners.delete(id);
+              return;
+            }
             flushPtyData(id);
             clearPtyData(id);
             maybeMarkProviderFinish(
@@ -892,15 +978,11 @@ export function registerPtyIpc(): void {
               signal,
               isAppQuitting ? 'app_quit' : 'process_exit'
             );
-            // Direct-spawn CLIs can be replaced immediately by a fallback shell after exit.
-            // If this PTY has already been replaced, skip cleanup so we don't delete the new PTY record.
             const current = getPty(id);
             if (current && current !== proc) {
               return;
             }
             safeSendToOwner(id, `pty:exit:${id}`, { exitCode, signal });
-            // For direct spawn: keep owner (shell respawn reuses it), delete listeners (shell respawn re-adds)
-            // For fallback: clean up owner since no shell respawn happens
             if (usedFallback) {
               owners.delete(id);
             }
